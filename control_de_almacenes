@@ -1,0 +1,225 @@
+import pulp
+import matplotlib.pyplot as plt
+import pandas as pd
+from tabulate import tabulate
+
+
+def pedir_entero(mensaje):
+    while True:
+        try:
+            return int(input(mensaje))
+        except ValueError:
+            print("Ingresa un número entero válido.")
+
+
+def pedir_flotante(mensaje):
+    while True:
+        try:
+            return float(input(mensaje))
+        except ValueError:
+            print("Ingresa un número válido.")
+
+
+def dividir_en_trimestres(periodos, semanas_por_trimestre):
+    trimestres = {}
+    inicio = 0
+    for i, cantidad in enumerate(semanas_por_trimestre, start=1):
+        trimestres[i] = periodos[inicio:inicio + cantidad]
+        inicio += cantidad
+    return trimestres
+
+
+def ingresar_datos():
+    print("MODELO DE CONTROL DE INVENTARIO")
+
+    variacion_maxima = pedir_entero("¿Cuál es la variación máxima permitida entre periodos de producción? ")
+    produccion_minima_fija = pedir_entero("¿Cuál es la producción mínima fija por periodo? ")
+
+    semanas_por_trimestre = list(map(int, input("Ingresa cuántas semanas tiene cada trimestre (ej. 13 13 13 13): ").split()))
+
+    num_productos = pedir_entero("¿Cuántos productos quieres gestionar? ")
+    num_periodos = sum(semanas_por_trimestre)
+
+    periodos = list(range(1, num_periodos + 1))
+    productos = {}
+
+    for i in range(num_productos):
+        print(f"\nProducto #{i+1}")
+        nombre = input("   Nombre del producto: ")
+        costo = pedir_flotante(f"   Costo de almacenamiento por unidad de '{nombre}': ")
+        costo_produccion = pedir_flotante(f"   Costo de producción por unidad de '{nombre}': ")
+        inv_inicial = pedir_flotante(f"   Inventario inicial de '{nombre}': ")
+        densidad = pedir_flotante(f"   Densidad en bytes por wafer de '{nombre}': ")
+
+        demanda = {}
+        produccion_propuesta = {}
+
+        while True:
+            for t in periodos:
+                demanda[t] = pedir_entero(f"   Demanda en el periodo {t} para '{nombre}': ")
+                produccion_propuesta[t] = pedir_entero(f"   Producción propuesta en el periodo {t} para '{nombre}': ")
+
+            error = False
+            for t in periodos[1:]:
+                dif = abs(produccion_propuesta[t] - produccion_propuesta[t - 1])
+                if dif > variacion_maxima:
+                    print(f"\nERROR: La variación de producción entre el periodo {t-1} y {t} para '{nombre}' es de {dif}, lo cual excede el máximo permitido ({variacion_maxima}).")
+                    print("   La variación máxima no lo permite. Vuelve a ingresar los valores de producción.")
+                    error = True
+                    break
+
+            if not error:
+                break
+
+        min_prod = pedir_flotante(f"   Capacidad mínima de producción por periodo para '{nombre}': ")
+        max_prod = pedir_flotante(f"   Capacidad máxima de producción por periodo para '{nombre}': ")
+
+        productos[nombre] = {
+            'costo': costo,
+            'costo_produccion': costo_produccion,
+            'inventario_inicial': inv_inicial,
+            'densidad': densidad,
+            'demanda': demanda,
+            'min_prod': min_prod,
+            'max_prod': max_prod,
+            'produccion_propuesta': produccion_propuesta
+        }
+
+    return productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija
+
+
+def construir_modelo(productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija, modo="flexible"):
+    modelo = pulp.LpProblem("Control_de_Inventario", pulp.LpMinimize)
+    produccion = {}
+    produccion_int = {}
+    inventario = {}
+
+    for producto in productos:
+        produccion_int[producto] = pulp.LpVariable.dicts(f"ProdInt_{producto}_{modo}", periodos, cat='Integer')
+        produccion[producto] = {t: 5 * produccion_int[producto][t] for t in periodos}
+        inventario[producto] = pulp.LpVariable.dicts(f"Inv_{producto}_{modo}", periodos, lowBound=0)
+
+    modelo += pulp.lpSum([
+        productos[prod]['costo'] * inventario[prod][t] +
+        productos[prod]['costo_produccion'] * produccion[prod][t]
+        for prod in productos for t in periodos
+    ])
+
+    for producto in productos:
+        for t in periodos:
+            if t == 1:
+                modelo += (
+                    produccion[producto][t] +
+                    productos[producto]['inventario_inicial'] -
+                    productos[producto]['demanda'][t] ==
+                    inventario[producto][t]
+                )
+            else:
+                modelo += (
+                    produccion[producto][t] +
+                    inventario[producto][t-1] -
+                    productos[producto]['demanda'][t] ==
+                    inventario[producto][t]
+                )
+
+            modelo += (produccion[producto][t] >= productos[producto]['min_prod'])
+            modelo += (produccion[producto][t] <= productos[producto]['max_prod'])
+            modelo += (produccion[producto][t] >= produccion_minima_fija)
+
+            if modo == "inventario_cero":
+                modelo += (inventario[producto][t] == 0)
+
+        for t in periodos[1:]:
+            modelo += (
+                produccion[producto][t] - produccion[producto][t-1] <= variacion_maxima,
+                f"RampUp_{producto}_semana{t}"
+            )
+            modelo += (
+                produccion[producto][t-1] - produccion[producto][t] <= variacion_maxima,
+                f"RampDown_{producto}_semana{t}"
+            )
+
+    for t in periodos:
+        modelo += (
+            pulp.lpSum([produccion[prod][t] for prod in productos]) >= produccion_minima_fija,
+            f"Produccion_Minima_Total_Semana_{t}"
+        )
+
+    trimestres = dividir_en_trimestres(periodos, semanas_por_trimestre)
+    for trimestre, semanas in trimestres.items():
+        total_inventario_bytes = pulp.lpSum([
+            inventario[prod][t] * productos[prod]['densidad']
+            for prod in productos
+            for t in semanas if t in inventario[prod]
+        ])
+        modelo += (total_inventario_bytes >= 70000000, f"MinInventarioBytes_Trimestre{trimestre}")
+        modelo += (total_inventario_bytes <= 140000000, f"MaxInventarioBytes_Trimestre{trimestre}")
+
+    return modelo, produccion, inventario
+
+
+def ejecutar_escenario(nombre, productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija, modo):
+    modelo, produccion, inventario = construir_modelo(productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija, modo)
+    modelo.solve()
+
+    resultado = {
+        'estado': pulp.LpStatus[modelo.status],
+        'costo': pulp.value(modelo.objective),
+        'produccion': {prod: {t: produccion[prod][t].value() for t in periodos} for prod in productos},
+        'inventario': {prod: {t: inventario[prod][t].value() for t in periodos} for prod in productos}
+    }
+    return nombre, resultado
+
+
+def comparar_escenarios(productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija):
+    escenarios = [
+        ejecutar_escenario("Flexible (propuesto)", productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija, "flexible"),
+        ejecutar_escenario("Inventario Cero", productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija, "inventario_cero"),
+        ejecutar_escenario("Inventario Dado", productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija, "flexible")
+    ]
+
+    print("\nComparación de Escenarios por Producto:")
+    for producto in productos:
+        print(f"\nProducto: {producto}")
+        for nombre, res in escenarios:
+            print(f"   Escenario: {nombre}")
+            estado = res['estado']
+            print(f"      Estado: {estado}")
+            if estado == "Optimal":
+                print(f"      Costo total: {res['costo']:.2f}")
+                for t in periodos:
+                    p = res['produccion'][producto][t]
+                    i = res['inventario'][producto][t]
+                    print(f"         Periodo {t}: Producción = {p:.2f}, Inventario = {i:.2f}")
+            else:
+                print("      No se pudo encontrar una solución factible.")
+
+    # Visualización en tabla y gráfica para escenario propuesto
+    nombre_escenario = "Flexible (propuesto)"
+    for producto in productos:
+        for nombre, res in escenarios:
+            if nombre == nombre_escenario and res['estado'] == "Optimal":
+                df = pd.DataFrame({
+                    'Periodo': periodos,
+                    'Producción': [res['produccion'][producto][t] for t in periodos],
+                    'Inventario': [res['inventario'][producto][t] for t in periodos]
+                })
+
+                print(f"\nTabla de Resultados - Producto: {producto}")
+                print(tabulate(df, headers='keys', tablefmt='grid', showindex=False))
+
+                plt.figure(figsize=(10, 4))
+                plt.plot(df['Periodo'], df['Producción'], marker='o', label='Producción')
+                plt.plot(df['Periodo'], df['Inventario'], marker='x', label='Inventario')
+                plt.title(f'Producto {producto} - Escenario {nombre_escenario}')
+                plt.xlabel('Periodo')
+                plt.ylabel('Unidades')
+                plt.grid(True)
+                plt.legend()
+                plt.tight_layout()
+                plt.show()
+
+
+if _name_ == "_main_":
+    productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija = ingresar_datos()
+    comparar_escenarios(productos, periodos, semanas_por_trimestre, variacion_maxima, produccion_minima_fija)
